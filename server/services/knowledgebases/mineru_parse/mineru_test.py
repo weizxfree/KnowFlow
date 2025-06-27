@@ -2,18 +2,29 @@ import os
 import re
 import tempfile
 import shutil
+import json
 from typing import Callable, Tuple
 from loguru import logger
 from .minio_server import get_image_url
-from magic_pdf.data.data_reader_writer import FileBasedDataWriter, FileBasedDataReader
-from magic_pdf.data.dataset import PymuDocDataset
-from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
-from magic_pdf.config.enums import SupportedPdfParseMethod
 from .file_converter import ensure_pdf
+from concurrent.futures import ThreadPoolExecutor
+
+from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2
+from mineru.data.data_reader_writer import FileBasedDataWriter, FileBasedDataReader
+from mineru.utils.enum_class import MakeMode
+from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
+from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make
 
 # 常量定义
 OUTPUT_DIR_NAME = "output"
 IMAGE_DIR_NAME = "images"
+MINERU_BACKEND = "sglang-client"
+
+
+def get_configured_mineru_server_url():
+    """获取配置的mineru服务端地址"""
+    return os.environ.get("MINERU_SERVER_URL", "http://127.0.0.1:30000")
+
 
 def _setup_directories(base_job_temp_dir: str) -> Tuple[str, str]:
     """在指定的任务根临时目录下初始化 'output' 和 'output/images' 子目录。
@@ -43,29 +54,35 @@ def _process_pdf_content(pdf_bytes: bytes, images_full_path: str) -> any:
         images_full_path: 图片写入器将使用的绝对基础路径 (例如 /tmp/jobXYZ/output/images)
     
     Returns:
-        pipe_result: 处理后的结果对象
+        middle_json: 处理后的json结果对象
     """
-    ds = PymuDocDataset(pdf_bytes)
-    pdf_type = ds.classify()
-    logger.info(f"PDF分类结果: {pdf_type}")
+    pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes)
     
     image_writer = FileBasedDataWriter(images_full_path)
-    if pdf_type == SupportedPdfParseMethod.OCR:
-        logger.info("使用OCR模式处理PDF...")
-        return ds.apply(doc_analyze, ocr=True).pipe_ocr_mode(image_writer)
-    else:
-        logger.info("使用文本模式处理PDF...")
-        return ds.apply(doc_analyze, ocr=False).pipe_txt_mode(image_writer)
+    server_url = get_configured_mineru_server_url()
+    
+    with ThreadPoolExecutor() as executor:
+            future = executor.submit(vlm_doc_analyze, pdf_bytes, image_writer=image_writer, backend=MINERU_BACKEND, server_url=server_url)
+            middle_json, _ = future.result()
+    
+    return middle_json
 
-def _generate_markdown(pipe_result: any, name_without_suff: str, output_full_path: str, images_subdir_name_for_ref: str) -> str:
+def _generate_markdown(middle_json: any, name_without_suff: str, output_full_path: str, images_subdir_name_for_ref: str) -> str:
     """生成Markdown文件及相关内容"""
     md_writer = FileBasedDataWriter(output_full_path)
     md_file_name = f"{name_without_suff}.md"
     md_file_path = os.path.join(output_full_path, md_file_name)
     logger.info(f"生成Markdown文件: {md_file_path}")
-    pipe_result.dump_md(md_writer, md_file_name, images_subdir_name_for_ref)
-    pipe_result.dump_content_list(md_writer, f"{name_without_suff}_content_list.json", images_subdir_name_for_ref)
-    pipe_result.dump_middle_json(md_writer, f'{name_without_suff}_middle.json')
+    
+    pdf_info = middle_json["pdf_info"]
+    md_content_str = vlm_union_make(pdf_info, MakeMode.MM_MD, images_subdir_name_for_ref)
+    md_writer.write_string(md_file_name, md_content_str )
+    
+    content_list = vlm_union_make(pdf_info, MakeMode.CONTENT_LIST, images_subdir_name_for_ref)
+    md_writer.write_string(f"{name_without_suff}_content_list.json", json.dumps(content_list, ensure_ascii=False, indent=4))
+
+    md_writer.write_string(f"{name_without_suff}_middle.json", json.dumps(middle_json, ensure_ascii=False, indent=4))
+
     return md_file_path
 
 def process_pdf_with_minerU(file_input, update_progress=None):
@@ -102,9 +119,9 @@ def process_pdf_with_minerU(file_input, update_progress=None):
         name_without_suff = os.path.splitext(os.path.basename(pdf_path_to_process))[0]
         pdf_bytes = _read_pdf_bytes(pdf_path_to_process)
         
-        pipe_result = _process_pdf_content(pdf_bytes, images_full_path)
+        middle_json = _process_pdf_content(pdf_bytes, images_full_path)
         
-        md_file_path = _generate_markdown(pipe_result, name_without_suff, output_full_path, IMAGE_DIR_NAME)
+        md_file_path = _generate_markdown(middle_json, name_without_suff, output_full_path, IMAGE_DIR_NAME)
         
         update_progress(0.5, f"文件处理和Markdown生成完成: {os.path.basename(md_file_path)}")
         logger.info(f"最终生成的Markdown文件路径: {md_file_path}")
